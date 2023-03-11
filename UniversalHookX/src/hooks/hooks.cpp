@@ -15,6 +15,8 @@
 #include "../menu/menu.hpp"
 #include "../utils/utils.hpp"
 
+#include "../dependencies/imgui/imgui_impl_dx9.h"
+#include "../dependencies/imgui/imgui_impl_win32.h"
 #include "../dependencies/minhook/MinHook.h"
 
 static HWND g_hWindow = NULL;
@@ -61,16 +63,55 @@ static LRESULT WINAPI WndProc(const HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM 
     }
 
     LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
-    if (Menu::bShowMenu) {
-        ImGui_ImplWin32_WndProcHandler(hWnd, uMsg, wParam, lParam);
 
-        // (Doesn't work for some games like 'Sid Meier's Civilization VI')
-        // Window may not maximize from taskbar because 'H::bShowDemoWindow' is set to true by default. ('hooks.hpp')
-        //
-        // return ImGui_ImplWin32_WndProcHandler(hWnd, uMsg, wParam, lParam) == 0;
+	if (Menu::bShowMenu) {
+        ImGuiIO& io = ImGui::GetIO( );
+
+        switch (uMsg) {
+            case WM_LBUTTONDOWN:
+                io.MouseDown[0] = true;
+                break;
+            case WM_LBUTTONUP:
+                io.MouseDown[0] = false;
+                break;
+            case WM_RBUTTONDOWN:
+                io.MouseDown[1] = true;
+                break;
+            case WM_RBUTTONUP:
+                io.MouseDown[1] = false;
+                break;
+            case WM_MBUTTONDOWN:
+                io.MouseDown[2] = true;
+                break;
+            case WM_MBUTTONUP:
+                io.MouseDown[2] = false;
+                break;
+            case WM_MOUSEWHEEL:
+                io.MouseWheel += GET_WHEEL_DELTA_WPARAM(wParam) > 0 ? +1.0f : -1.0f;
+                break;
+            case WM_MOUSEMOVE:
+                io.MousePos.x = (signed short)(lParam);
+                io.MousePos.y = (signed short)(lParam >> 16);
+                break;
+            case WM_KEYDOWN:
+                if (wParam < 256)
+                    io.KeysDown[wParam] = 1;
+                break;
+            case WM_KEYUP:
+                if (wParam < 256)
+                    io.KeysDown[wParam] = 0;
+                break;
+            case WM_CHAR:
+                if (wParam > 0 && wParam < 0x10000)
+                    io.AddInputCharacter((unsigned short)wParam);
+                break;
+        }
+        if (io.WantCaptureMouse || io.WantCaptureKeyboard || io.WantTextInput) {
+            return true;
+        }
     }
+        return CallWindowProc(oWndProc, hWnd, uMsg, wParam, lParam);
 
-    return CallWindowProc(oWndProc, hWnd, uMsg, wParam, lParam);
 }
 
 namespace Hooks {
