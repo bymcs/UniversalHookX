@@ -25,18 +25,24 @@ static VkAllocationCallbacks* g_Allocator = NULL;
 static VkInstance g_Instance = VK_NULL_HANDLE;
 static VkPhysicalDevice g_PhysicalDevice = VK_NULL_HANDLE;
 static VkDevice g_FakeDevice = VK_NULL_HANDLE, g_Device = VK_NULL_HANDLE;
+
 static uint32_t g_QueueFamily = (uint32_t)-1;
+static std::vector<VkQueueFamilyProperties> g_QueueFamilies;
+
 static VkPipelineCache g_PipelineCache = VK_NULL_HANDLE;
 static VkDescriptorPool g_DescriptorPool = VK_NULL_HANDLE;
 static uint32_t g_MinImageCount = 2;
 static VkRenderPass g_RenderPass = VK_NULL_HANDLE;
 static ImGui_ImplVulkanH_Frame g_Frames[8] = { };
+static ImGui_ImplVulkanH_FrameSemaphores g_FrameSemaphores[8] = { };
+
 static HWND g_Hwnd = NULL;
 static VkExtent2D g_ImageExtent = { };
 
 static void CleanupDeviceVulkan( );
 static void CleanupRenderTarget( );
 static void RenderImGui_Vulkan(VkQueue queue, const VkPresentInfoKHR* pPresentInfo);
+static bool DoesQueueSupportGraphic(VkQueue queue, VkQueue* pGraphicQueue);
 
 static bool CreateDeviceVK( ) {
     // Create Vulkan Instance
@@ -85,14 +91,14 @@ static bool CreateDeviceVK( ) {
     {
         uint32_t count;
         vkGetPhysicalDeviceQueueFamilyProperties(g_PhysicalDevice, &count, NULL);
-        VkQueueFamilyProperties* queues = new VkQueueFamilyProperties[sizeof(VkQueueFamilyProperties) * count];
-        vkGetPhysicalDeviceQueueFamilyProperties(g_PhysicalDevice, &count, queues);
-        for (uint32_t i = 0; i < count; ++i)
-            if (queues[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+        g_QueueFamilies.resize(count);
+        vkGetPhysicalDeviceQueueFamilyProperties(g_PhysicalDevice, &count, g_QueueFamilies.data( ));
+        for (uint32_t i = 0; i < count; ++i) {
+            if (g_QueueFamilies[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
                 g_QueueFamily = i;
                 break;
             }
-        delete[] queues;
+        }
         IM_ASSERT(g_QueueFamily != (uint32_t)-1);
 
         LOG("[+] Vulkan: g_QueueFamily: %u\n", g_QueueFamily);
@@ -135,6 +141,7 @@ static void CreateRenderTarget(VkDevice device, VkSwapchainKHR swapchain) {
         g_Frames[i].Backbuffer = backbuffers[i];
 
         ImGui_ImplVulkanH_Frame* fd = &g_Frames[i];
+        ImGui_ImplVulkanH_FrameSemaphores* fsd = &g_FrameSemaphores[i];
         {
             VkCommandPoolCreateInfo info = { };
             info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -151,6 +158,18 @@ static void CreateRenderTarget(VkDevice device, VkSwapchainKHR swapchain) {
             info.commandBufferCount = 1;
 
             vkAllocateCommandBuffers(device, &info, &fd->CommandBuffer);
+        }
+        {
+            VkFenceCreateInfo info = { };
+            info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+            info.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+            vkCreateFence(device, &info, g_Allocator, &fd->Fence);
+        }
+        {
+            VkSemaphoreCreateInfo info = { };
+            info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+            vkCreateSemaphore(device, &info, g_Allocator, &fsd->ImageAcquiredSemaphore);
+            vkCreateSemaphore(device, &info, g_Allocator, &fsd->RenderCompleteSemaphore);
         }
     }
 
@@ -263,6 +282,15 @@ static VkResult VKAPI_CALL hkAcquireNextImageKHR(VkDevice device,
     return oAcquireNextImageKHR(device, swapchain, timeout, semaphore, fence, pImageIndex);
 }
 
+static std::add_pointer_t<VkResult VKAPI_CALL(VkDevice, const VkAcquireNextImageInfoKHR*, uint32_t*)> oAcquireNextImage2KHR;
+static VkResult VKAPI_CALL hkAcquireNextImage2KHR(VkDevice device,
+                                                  const VkAcquireNextImageInfoKHR* pAcquireInfo,
+                                                  uint32_t* pImageIndex) {
+    g_Device = device;
+
+    return oAcquireNextImage2KHR(device, pAcquireInfo, pImageIndex);
+}
+
 static std::add_pointer_t<VkResult VKAPI_CALL(VkQueue, const VkPresentInfoKHR*)> oQueuePresentKHR;
 static VkResult VKAPI_CALL hkQueuePresentKHR(VkQueue queue,
                                              const VkPresentInfoKHR* pPresentInfo) {
@@ -290,6 +318,7 @@ namespace VK {
         }
 
         void* fnAcquireNextImageKHR = reinterpret_cast<void*>(vkGetDeviceProcAddr(g_FakeDevice, "vkAcquireNextImageKHR"));
+        void* fnAcquireNextImage2KHR = reinterpret_cast<void*>(vkGetDeviceProcAddr(g_FakeDevice, "vkAcquireNextImage2KHR"));
         void* fnQueuePresentKHR = reinterpret_cast<void*>(vkGetDeviceProcAddr(g_FakeDevice, "vkQueuePresentKHR"));
         void* fnCreateSwapchainKHR = reinterpret_cast<void*>(vkGetDeviceProcAddr(g_FakeDevice, "vkCreateSwapchainKHR"));
 
@@ -303,14 +332,17 @@ namespace VK {
 
             // Hook
             LOG("[+] Vulkan: fnAcquireNextImageKHR: 0x%p\n", fnAcquireNextImageKHR);
+            LOG("[+] Vulkan: fnAcquireNextImage2KHR: 0x%p\n", fnAcquireNextImage2KHR);
             LOG("[+] Vulkan: fnQueuePresentKHR: 0x%p\n", fnQueuePresentKHR);
             LOG("[+] Vulkan: fnCreateSwapchainKHR: 0x%p\n", fnCreateSwapchainKHR);
 
             static MH_STATUS aniStatus = MH_CreateHook(reinterpret_cast<void**>(fnAcquireNextImageKHR), &hkAcquireNextImageKHR, reinterpret_cast<void**>(&oAcquireNextImageKHR));
+            static MH_STATUS ani2Status = MH_CreateHook(reinterpret_cast<void**>(fnAcquireNextImage2KHR), &hkAcquireNextImage2KHR, reinterpret_cast<void**>(&oAcquireNextImage2KHR));
             static MH_STATUS qpStatus = MH_CreateHook(reinterpret_cast<void**>(fnQueuePresentKHR), &hkQueuePresentKHR, reinterpret_cast<void**>(&oQueuePresentKHR));
             static MH_STATUS csStatus = MH_CreateHook(reinterpret_cast<void**>(fnCreateSwapchainKHR), &hkCreateSwapchainKHR, reinterpret_cast<void**>(&oCreateSwapchainKHR));
 
             MH_EnableHook(fnAcquireNextImageKHR);
+            MH_EnableHook(fnAcquireNextImage2KHR);
             MH_EnableHook(fnQueuePresentKHR);
             MH_EnableHook(fnCreateSwapchainKHR);
         }
@@ -333,6 +365,10 @@ namespace VK {
 
 static void CleanupRenderTarget( ) {
     for (uint32_t i = 0; i < RTL_NUMBER_OF(g_Frames); ++i) {
+        if (g_Frames[i].Fence) {
+            vkDestroyFence(g_Device, g_Frames[i].Fence, g_Allocator);
+            g_Frames[i].Fence = VK_NULL_HANDLE;
+        }
         if (g_Frames[i].CommandBuffer) {
             vkFreeCommandBuffers(g_Device, g_Frames[i].CommandPool, 1, &g_Frames[i].CommandBuffer);
             g_Frames[i].CommandBuffer = VK_NULL_HANDLE;
@@ -348,6 +384,17 @@ static void CleanupRenderTarget( ) {
         if (g_Frames[i].Framebuffer) {
             vkDestroyFramebuffer(g_Device, g_Frames[i].Framebuffer, g_Allocator);
             g_Frames[i].Framebuffer = VK_NULL_HANDLE;
+        }
+    }
+
+    for (uint32_t i = 0; i < RTL_NUMBER_OF(g_FrameSemaphores); ++i) {
+        if (g_FrameSemaphores[i].ImageAcquiredSemaphore) {
+            vkDestroySemaphore(g_Device, g_FrameSemaphores[i].ImageAcquiredSemaphore, g_Allocator);
+            g_FrameSemaphores[i].ImageAcquiredSemaphore = VK_NULL_HANDLE;
+        }
+        if (g_FrameSemaphores[i].RenderCompleteSemaphore) {
+            vkDestroySemaphore(g_Device, g_FrameSemaphores[i].RenderCompleteSemaphore, g_Allocator);
+            g_FrameSemaphores[i].RenderCompleteSemaphore = VK_NULL_HANDLE;
         }
     }
 }
@@ -372,6 +419,9 @@ static void RenderImGui_Vulkan(VkQueue queue, const VkPresentInfoKHR* pPresentIn
     if (!g_Device || H::bShuttingDown)
         return;
 
+    VkQueue graphicQueue = VK_NULL_HANDLE;
+    const bool queueSupportsGraphic = DoesQueueSupportGraphic(queue, &graphicQueue);
+
     Menu::InitializeContext(g_Hwnd);
 
     for (uint32_t i = 0; i < pPresentInfo->swapchainCount; ++i) {
@@ -381,6 +431,11 @@ static void RenderImGui_Vulkan(VkQueue queue, const VkPresentInfoKHR* pPresentIn
         }
 
         ImGui_ImplVulkanH_Frame* fd = &g_Frames[pPresentInfo->pImageIndices[i]];
+        ImGui_ImplVulkanH_FrameSemaphores* fsd = &g_FrameSemaphores[pPresentInfo->pImageIndices[i]];
+        {
+            vkWaitForFences(g_Device, 1, &fd->Fence, VK_TRUE, ~0ull);
+            vkResetFences(g_Device, 1, &fd->Fence);
+        }
         {
             vkResetCommandBuffer(fd->CommandBuffer, 0);
 
@@ -412,7 +467,7 @@ static void RenderImGui_Vulkan(VkQueue queue, const VkPresentInfoKHR* pPresentIn
             init_info.PhysicalDevice = g_PhysicalDevice;
             init_info.Device = g_Device;
             init_info.QueueFamily = g_QueueFamily;
-            init_info.Queue = queue;
+            init_info.Queue = graphicQueue;
             init_info.PipelineCache = g_PipelineCache;
             init_info.DescriptorPool = g_DescriptorPool;
             init_info.Subpass = 0;
@@ -438,16 +493,77 @@ static void RenderImGui_Vulkan(VkQueue queue, const VkPresentInfoKHR* pPresentIn
 
         // Submit command buffer
         vkCmdEndRenderPass(fd->CommandBuffer);
-        {
+        vkEndCommandBuffer(fd->CommandBuffer);
+
+        uint32_t waitSemaphoresCount = i == 0 ? pPresentInfo->waitSemaphoreCount : 0;
+        if (waitSemaphoresCount == 0 && !queueSupportsGraphic) {
+            constexpr VkPipelineStageFlags stages_wait = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+            {
+                VkSubmitInfo info = { };
+                info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+
+                info.pWaitDstStageMask = &stages_wait;
+
+                info.signalSemaphoreCount = 1;
+                info.pSignalSemaphores = &fsd->RenderCompleteSemaphore;
+
+                vkQueueSubmit(queue, 1, &info, VK_NULL_HANDLE);
+            }
+            {
+                VkSubmitInfo info = { };
+                info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+                info.commandBufferCount = 1;
+                info.pCommandBuffers = &fd->CommandBuffer;
+
+                info.pWaitDstStageMask = &stages_wait;
+                info.waitSemaphoreCount = 1;
+                info.pWaitSemaphores = &fsd->RenderCompleteSemaphore;
+
+                info.signalSemaphoreCount = 1;
+                info.pSignalSemaphores = &fsd->ImageAcquiredSemaphore;
+
+                vkQueueSubmit(graphicQueue, 1, &info, fd->Fence);
+            }
+        } else {
+            std::vector<VkPipelineStageFlags> stages_wait(waitSemaphoresCount, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+
             VkSubmitInfo info = { };
             info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
             info.commandBufferCount = 1;
             info.pCommandBuffers = &fd->CommandBuffer;
 
-            vkEndCommandBuffer(fd->CommandBuffer);
-            vkQueueSubmit(queue, 1, &info, NULL);
+            info.pWaitDstStageMask = stages_wait.data( );
+            info.waitSemaphoreCount = waitSemaphoresCount;
+            info.pWaitSemaphores = pPresentInfo->pWaitSemaphores;
+
+            info.signalSemaphoreCount = 1;
+            info.pSignalSemaphores = &fsd->ImageAcquiredSemaphore;
+
+            vkQueueSubmit(graphicQueue, 1, &info, fd->Fence);
         }
     }
+}
+
+static bool DoesQueueSupportGraphic(VkQueue queue, VkQueue* pGraphicQueue) {
+    for (uint32_t i = 0; i < g_QueueFamilies.size( ); ++i) {
+        const VkQueueFamilyProperties& family = g_QueueFamilies[i];
+        for (uint32_t j = 0; j < family.queueCount; ++j) {
+            VkQueue it = VK_NULL_HANDLE;
+            vkGetDeviceQueue(g_Device, i, j, &it);
+
+            if (pGraphicQueue && family.queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+                if (*pGraphicQueue == VK_NULL_HANDLE) {
+                    *pGraphicQueue = it;
+                }
+            }
+
+            if (queue == it && family.queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+                return true;
+            }
+        }
+    }
+
+    return false;
 }
 
 #else
